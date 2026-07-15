@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -16,7 +17,8 @@ from openai import OpenAI
 from tqdm import tqdm
 
 PROMPT_TEMPLATE = """
-    目的: 放射線科専門医が作成した参照放射線診断レポートと比較して、候補レポートの正確性を評価すること。
+    目的: 放射線科専門医が作成した参照放射線診断
+レポートと比較して、候補レポートの正確性を評価すること。
 
     プロセスの概要: 以下が提示される。
 
@@ -32,14 +34,16 @@ PROMPT_TEMPLATE = """
     臨床的に有意な誤りの件数。
     臨床的に重要でない誤りの件数。
 
-    誤りは次のいずれかのカテゴリーに該当する。
+    誤りは次のいずれ
+かのカテゴリーに該当する。
 
     a) 候補報告における虚偽の所見報告。
     b) 参照に存在する所見の欠落。
     c) 所見の解剖学的位置/位置関係の誤同定。
     d) 所見の重症度の誤評価。
     e) 参照にない比較の記載。
-    f) 以前の検査からの変化を示す比較の省略。
+    f) 以前の検査からの変化を示す比較の
+省略。
     注: レポートの文体ではなく臨床所見に着目すること。両方のレポートに現れる所見のみを評価すること。
 
     2. 参照レポート:
@@ -55,7 +59,8 @@ PROMPT_TEMPLATE = """
     [説明]:
     <説明>
 
-    [臨床的に有意な誤り]:
+    [臨床的に有
+意な誤り]:
     (a) <誤りの種類>: <誤りの数>. <誤り1>; <誤り2>; ...; <誤りn>
     ....
     (f) <誤りの種類>: <誤りの数>. <誤り1>; <誤り2>; ...; <誤りn>
@@ -70,46 +75,142 @@ PROMPT_TEMPLATE = """
     ```
     """.lstrip("\n")
 
-INSTRUCTIONS = """
-Translate the supplied GREEN dataset records from English to Japanese.
-Keep all JSON key names unchanged in English. Translate only key.candidate,
-key.reference, and response. Preserve record indices, medical meaning,
-laterality, negation, uncertainty, measurements, severity, temporal change,
-line breaks, and anonymization placeholders such as ___, ____, XXXX, and xxxx.
-Do not correct source errors because they are part of the evaluation dataset.
-Translate response headings as follows when present:
+REPORT_INSTRUCTIONS = """
+Translate the candidate and reference radiology reports from English to Japanese.
+Keep JSON keys and integer indices unchanged. Preserve medical meaning exactly,
+especially laterality, anatomy, negation, uncertainty, severity, measurements,
+temporal comparison, and device positions. Do not correct source errors because
+they are part of the evaluation dataset. Preserve anonymization placeholders such
+as ___, ____, XXXX, and xxxx exactly. Return only JSON matching the schema.
+""".strip()
+
+RESPONSE_INSTRUCTIONS = """
+Translate the COMPLETE GREEN evaluation response from English to Japanese.
+Every English sentence, phrase, error-category name, finding description, and
+section heading must be translated. Do not stop after translating only the
+explanation or headings. Do not leave English prose anywhere in the response,
+except unavoidable medical abbreviations, anonymization tokens, and isolated
+letters used as category labels such as (a) through (f).
+
+Keep JSON keys and integer indices unchanged. Preserve all error counts,
+category letters, clinical meaning, laterality, negation, measurements,
+comparisons, line breaks, semicolons, and anonymization placeholders exactly.
+Do not correct errors in the source.
+
+Translate headings as follows when present:
 [Explanation] -> [説明]
 [Clinically Significant Errors] -> [臨床的に有意な誤り]
 [Clinically Insignificant Errors] -> [臨床的に重要でない誤り]
 [Matched Findings] -> [一致する所見]
-Return only JSON matching the required schema.
+
+Translate recurring category labels consistently:
+False report of a finding in the candidate -> 候補レポートにおける虚偽の所見報告
+Missing a finding present in the reference -> 参照レポートに存在する所見の欠落
+Misidentification of a finding's anatomic location/position -> 所見の解剖学的位置／位置関係の誤同定
+Misassessment of the severity of a finding -> 所見の重症度の誤評価
+Mentioning a comparison that isn't in the reference -> 参照レポートにない比較の記載
+Omitting a comparison detailing a change from a prior study -> 前回検査からの変化を示す比較の省略
+
+Return only JSON matching the schema.
 """.strip()
 
-ITEM_SCHEMA: dict[str, Any] = {
+REPORT_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "index": {"type": "integer"},
-        "key": {
-            "type": "object",
-            "properties": {
-                "candidate": {"type": "string"},
-                "reference": {"type": "string"},
-            },
-            "required": ["candidate", "reference"],
-            "additionalProperties": False,
-        },
-        "response": {"type": "string"},
+        "candidate": {"type": "string"},
+        "reference": {"type": "string"},
     },
-    "required": ["index", "key", "response"],
+    "required": ["index", "candidate", "reference"],
     "additionalProperties": False,
 }
 
-BATCH_SCHEMA: dict[str, Any] = {
+RESPONSE_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"records": {"type": "array", "items": ITEM_SCHEMA}},
+    "properties": {
+        "index": {"type": "integer"},
+        "response": {"type": "string"},
+    },
+    "required": ["index", "response"],
+    "additionalProperties": False,
+}
+
+REPORT_BATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "records": {"type": "array", "items": REPORT_ITEM_SCHEMA}
+    },
     "required": ["records"],
     "additionalProperties": False,
 }
+
+RESPONSE_BATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "records": {"type": "array", "items": RESPONSE_ITEM_SCHEMA}
+    },
+    "required": ["records"],
+    "additionalProperties": False,
+}
+
+
+ENGLISH_RESPONSE_PHRASES = (
+    "Clinically Significant Errors",
+    "Clinically Insignificant Errors",
+    "Matched Findings",
+    "False report of a finding",
+    "Missing a finding present in the reference",
+    "Misidentification of a finding",
+    "Misassessment of the severity",
+    "Mentioning a comparison",
+    "Omitting a comparison",
+    "The candidate report",
+    "The reference report",
+)
+
+
+def response_translation_looks_complete(source_text: str, translated_text: str) -> tuple[bool, str]:
+    """Heuristically reject partially untranslated or truncated responses."""
+    if not translated_text.strip():
+        return False, "empty translated response"
+
+    # Required translated headings when their English equivalents exist.
+    heading_pairs = (
+        ("[Explanation]", "[説明]"),
+        ("[Clinically Significant Errors]", "[臨床的に有意な誤り]"),
+        ("[Clinically Insignificant Errors]", "[臨床的に重要でない誤り]"),
+        ("[Matched Findings]", "[一致する所見]"),
+    )
+    for english, japanese in heading_pairs:
+        if english in source_text and japanese not in translated_text:
+            return False, f"missing translated heading: {japanese}"
+
+    for phrase in ENGLISH_RESPONSE_PHRASES:
+        if phrase.lower() in translated_text.lower():
+            return False, f"untranslated English phrase remains: {phrase}"
+
+    # A Japanese translation should contain Japanese characters.
+    japanese_chars = len(re.findall(r"[ぁ-んァ-ヶ一-龠]", translated_text))
+    if japanese_chars < 10:
+        return False, "too few Japanese characters"
+
+    # Reject suspicious truncation. Japanese can be shorter than English, but
+    # responses below 35% of the source length are usually incomplete.
+    if len(source_text) >= 200 and len(translated_text) < len(source_text) * 0.35:
+        return False, "translated response is suspiciously short"
+
+    # Detect long runs of ordinary English prose while allowing abbreviations
+    # such as CT, SVC, PICC, ET, NG, and category letters.
+    english_words = re.findall(r"\b[A-Za-z]{3,}\b", translated_text)
+    allowed = {
+        "CT", "MRI", "PET", "SVC", "PICC", "PICC", "ETT", "CABG",
+        "COPD", "NG", "IJ", "AP", "PA", "None",
+    }
+    ordinary = [w for w in english_words if w.upper() not in allowed]
+    if len(ordinary) >= 12:
+        return False, f"too much English prose remains ({len(ordinary)} words)"
+
+    return True, ""
 
 _tls = threading.local()
 
@@ -121,12 +222,18 @@ def get_client() -> OpenAI:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description=(
+            "Translate candidate/reference with gpt-5-nano and response with "
+            "gpt-5-mini, then build prompt locally."
+        )
+    )
     p.add_argument("--input", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--errors", type=Path)
-    p.add_argument("--model", default="gpt-5-mini")
+    p.add_argument("--report-model", default="gpt-5-nano")
+    p.add_argument("--response-model", default="gpt-5-mini")
     p.add_argument("--batch-size", type=int, default=5)
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--limit", type=int)
@@ -141,83 +248,227 @@ def load_json(path: Path) -> list[dict[str, Any]]:
         data = json.load(f)
     if not isinstance(data, list):
         raise ValueError("Top-level JSON must be a list.")
+    for i, record in enumerate(data):
+        if not isinstance(record, dict):
+            raise ValueError(f"Record {i} is not an object.")
+        if not isinstance(record.get("key"), dict):
+            raise ValueError(f"Record {i}: key must be an object.")
+        for field in ("candidate", "reference"):
+            if not isinstance(record["key"].get(field), str):
+                raise ValueError(f"Record {i}: key.{field} must be a string.")
+        if not isinstance(record.get("response"), str):
+            raise ValueError(f"Record {i}: response must be a string.")
     return data
 
 
-def make_api_item(index: int, record: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "index": index,
-        "key": {
-            "candidate": record["key"]["candidate"],
-            "reference": record["key"]["reference"],
-        },
-        "response": record["response"],
-    }
-
-
 def build_prompt(reference: str, candidate: str) -> str:
-    return (PROMPT_TEMPLATE
-            .replace("__REFERENCE_REPORT__", reference)
-            .replace("__CANDIDATE_REPORT__", candidate))
-
-
-def finalize(item: dict[str, Any]) -> dict[str, Any]:
-    candidate = item["key"]["candidate"]
-    reference = item["key"]["reference"]
-    return {
-        "key": {"candidate": candidate, "reference": reference},
-        "response": item["response"],
-        "prompt": build_prompt(reference, candidate),
-    }
+    return (
+        PROMPT_TEMPLATE
+        .replace("__REFERENCE_REPORT__", reference)
+        .replace("__CANDIDATE_REPORT__", candidate)
+    )
 
 
 def placeholder_counts(text: str) -> dict[str, int]:
-    return {t: text.count(t) for t in ("___", "____", "XXXX", "xxxx")}
+    return {token: text.count(token) for token in ("___", "____", "XXXX", "xxxx")}
 
 
-def validate_batch(src: list[dict[str, Any]], dst: list[dict[str, Any]]) -> None:
-    if len(src) != len(dst):
-        raise ValueError("Batch length changed.")
-    src_map = {x["index"]: x for x in src}
-    dst_map = {x["index"]: x for x in dst}
-    if set(src_map) != set(dst_map):
-        raise ValueError("Record indices changed.")
-    for i, s in src_map.items():
-        d = dst_map[i]
-        for field in ("candidate", "reference"):
-            if placeholder_counts(s["key"][field]) != placeholder_counts(d["key"][field]):
-                raise ValueError(f"Placeholder mismatch at record {i}, {field}.")
-        if placeholder_counts(s["response"]) != placeholder_counts(d["response"]):
-            raise ValueError(f"Placeholder mismatch at record {i}, response.")
+def call_structured_batch(
+    *,
+    model: str,
+    instructions: str,
+    payload: dict[str, Any],
+    schema_name: str,
+    schema: dict[str, Any],
+    max_retries: int,
+) -> list[dict[str, Any]]:
+    raw_input = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    last_error: Exception | None = None
 
-
-def translate_batch(items: list[dict[str, Any]], model: str, max_retries: int) -> list[dict[str, Any]]:
-    payload = json.dumps({"records": items}, ensure_ascii=False, separators=(",", ":"))
-    last: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            r = get_client().responses.create(
+            response = get_client().responses.create(
                 model=model,
                 reasoning={"effort": "minimal"},
-                instructions=INSTRUCTIONS,
-                input=payload,
-                text={"format": {
-                    "type": "json_schema",
-                    "name": "green_translation_batch",
-                    "schema": BATCH_SCHEMA,
-                    "strict": True,
-                }},
+                instructions=instructions,
+                input=raw_input,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": schema_name,
+                        "schema": schema,
+                        "strict": True,
+                    }
+                },
             )
-            translated = json.loads(r.output_text)["records"]
-            validate_batch(items, translated)
-            by_index = {x["index"]: x for x in translated}
-            return [by_index[x["index"]] for x in items]
+            parsed = json.loads(response.output_text)
+            print(
+                f"input={response.usage.input_tokens}, "
+                f"output={response.usage.output_tokens}, "
+                f"total={response.usage.total_tokens}"
+            )
+            return parsed["records"]
         except Exception as exc:
-            last = exc
-            if attempt == max_retries:
+            last_error = exc
+            if attempt >= max_retries:
                 break
-            time.sleep(min(60, 2 ** attempt + random.random()))
-    raise RuntimeError(f"Batch failed after {max_retries + 1} attempts") from last
+            time.sleep(min(60.0, (2 ** attempt) + random.random()))
+
+    raise RuntimeError(
+        f"{schema_name} failed after {max_retries + 1} attempts"
+    ) from last_error
+
+
+def translate_reports(
+    indices: list[int],
+    source: list[dict[str, Any]],
+    model: str,
+    max_retries: int,
+) -> dict[int, dict[str, str]]:
+    source_items = [
+        {
+            "index": i,
+            "candidate": source[i]["key"]["candidate"],
+            "reference": source[i]["key"]["reference"],
+        }
+        for i in indices
+    ]
+
+    translated = call_structured_batch(
+        model=model,
+        instructions=REPORT_INSTRUCTIONS,
+        payload={"records": source_items},
+        schema_name="green_report_translation_batch",
+        schema=REPORT_BATCH_SCHEMA,
+        max_retries=max_retries,
+    )
+
+    src_map = {item["index"]: item for item in source_items}
+    dst_map = {item["index"]: item for item in translated}
+    if set(src_map) != set(dst_map):
+        raise ValueError("Report translation changed record indices.")
+
+    for i, src in src_map.items():
+        dst = dst_map[i]
+        for field in ("candidate", "reference"):
+            if placeholder_counts(src[field]) != placeholder_counts(dst[field]):
+                raise ValueError(f"Placeholder mismatch at record {i}, {field}.")
+
+    return {
+        i: {
+            "candidate": dst_map[i]["candidate"],
+            "reference": dst_map[i]["reference"],
+        }
+        for i in indices
+    }
+
+
+def translate_responses(
+    indices: list[int],
+    source: list[dict[str, Any]],
+    model: str,
+    max_retries: int,
+) -> dict[int, str]:
+    source_items = [
+        {"index": i, "response": source[i]["response"]}
+        for i in indices
+    ]
+    src_map = {item["index"]: item for item in source_items}
+    last_error: Exception | None = None
+
+    # Retry not only API errors, but also semantically incomplete translations.
+    for attempt in range(max_retries + 1):
+        try:
+            translated = call_structured_batch(
+                model=model,
+                instructions=RESPONSE_INSTRUCTIONS,
+                payload={"records": source_items},
+                schema_name="green_response_translation_batch",
+                schema=RESPONSE_BATCH_SCHEMA,
+                max_retries=0,
+            )
+
+            dst_map = {item["index"]: item for item in translated}
+            if set(src_map) != set(dst_map):
+                raise ValueError("Response translation changed record indices.")
+
+            for i, src in src_map.items():
+                translated_response = dst_map[i]["response"]
+                if placeholder_counts(src["response"]) != placeholder_counts(
+                    translated_response
+                ):
+                    raise ValueError(
+                        f"Placeholder mismatch at record {i}, response."
+                    )
+
+                complete, reason = response_translation_looks_complete(
+                    src["response"], translated_response
+                )
+                if not complete:
+                    raise ValueError(
+                        f"Incomplete response translation at record {i}: {reason}"
+                    )
+
+            return {i: dst_map[i]["response"] for i in indices}
+
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_retries:
+                break
+            delay = min(60.0, (2 ** attempt) + random.random())
+            print(
+                f"\nResponse batch beginning at {indices[0]} failed validation "
+                f"on attempt {attempt + 1}: {exc}\n"
+                f"Retrying in {delay:.1f} seconds...",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"Response batch beginning at {indices[0]} failed after "
+        f"{max_retries + 1} attempts"
+    ) from last_error
+
+
+def translate_dual_model_batch(
+    indices: list[int],
+    source: list[dict[str, Any]],
+    report_model: str,
+    response_model: str,
+    max_retries: int,
+) -> dict[int, dict[str, Any]]:
+    # The two translations are independent, so run them concurrently.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        report_future = pool.submit(
+            translate_reports,
+            indices,
+            source,
+            report_model,
+            max_retries,
+        )
+        response_future = pool.submit(
+            translate_responses,
+            indices,
+            source,
+            response_model,
+            max_retries,
+        )
+        reports = report_future.result()
+        responses = response_future.result()
+
+    final: dict[int, dict[str, Any]] = {}
+    for i in indices:
+        candidate = reports[i]["candidate"]
+        reference = reports[i]["reference"]
+        final[i] = {
+            "key": {
+                "candidate": candidate,
+                "reference": reference,
+            },
+            "response": responses[i],
+            "prompt": build_prompt(reference, candidate),
+        }
+    return final
 
 
 def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -230,15 +481,21 @@ def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def read_checkpoint(path: Path) -> dict[int, dict[str, Any]]:
-    done: dict[int, dict[str, Any]] = {}
+    completed: dict[int, dict[str, Any]] = {}
     if not path.exists():
-        return done
+        return completed
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
+        for line_number, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
                 row = json.loads(line)
-                done[int(row["index"])] = row["record"]
-    return done
+                completed[int(row["index"])] = row["record"]
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid checkpoint line {line_number}: {exc}"
+                ) from exc
+    return completed
 
 
 def chunks(values: list[int], size: int) -> list[list[int]]:
@@ -247,69 +504,115 @@ def chunks(values: list[int], size: int) -> list[list[int]]:
 
 def main() -> int:
     args = parse_args()
+
     if not os.environ.get("OPENAI_API_KEY"):
         print("OPENAI_API_KEY is not set.", file=sys.stderr)
         return 2
     if args.batch_size < 1 or args.workers < 1:
         raise ValueError("--batch-size and --workers must be >= 1")
+    if args.start_index < 0:
+        raise ValueError("--start-index must be >= 0")
 
-    checkpoint = args.checkpoint or args.output.with_name(args.output.name + ".checkpoint.jsonl")
-    errors = args.errors or args.output.with_name(args.output.name + ".errors.jsonl")
+    checkpoint = args.checkpoint or args.output.with_name(
+        args.output.name + ".checkpoint.jsonl"
+    )
+    errors = args.errors or args.output.with_name(
+        args.output.name + ".errors.jsonl"
+    )
 
     if args.overwrite:
-        for p in (args.output, checkpoint, errors):
-            if p.exists():
-                p.unlink()
+        for path in (args.output, checkpoint, errors):
+            if path.exists():
+                path.unlink()
 
     source = load_json(args.input)
-    stop = len(source) if args.limit is None else min(len(source), args.start_index + args.limit)
+    if args.start_index >= len(source):
+        raise ValueError(f"--start-index must be smaller than {len(source)}")
+
+    stop = len(source)
+    if args.limit is not None:
+        if args.limit < 1:
+            raise ValueError("--limit must be >= 1")
+        stop = min(len(source), args.start_index + args.limit)
+
     selected = list(range(args.start_index, stop))
     completed = read_checkpoint(checkpoint)
     pending = [i for i in selected if i not in completed]
     batches = chunks(pending, args.batch_size)
 
-    print(f"Selected: {len(selected)}, completed: {len(selected)-len(pending)}, pending: {len(pending)}")
-    print(f"batch-size={args.batch_size}, workers={args.workers}, model={args.model}")
+    print(
+        f"Selected: {len(selected)}, completed: {len(selected) - len(pending)}, "
+        f"pending: {len(pending)}"
+    )
+    print(
+        f"batch-size={args.batch_size}, workers={args.workers}, "
+        f"report-model={args.report_model}, response-model={args.response_model}"
+    )
 
     failed: list[list[int]] = []
-    with tqdm(total=len(selected), initial=len(selected) - len(pending), unit="record") as bar:
+    with tqdm(
+        total=len(selected),
+        initial=len(selected) - len(pending),
+        unit="record",
+    ) as bar:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {}
-            for idxs in batches:
-                api_items = [make_api_item(i, source[i]) for i in idxs]
-                fut = pool.submit(translate_batch, api_items, args.model, args.max_retries)
-                futures[fut] = idxs
+            futures = {
+                pool.submit(
+                    translate_dual_model_batch,
+                    idxs,
+                    source,
+                    args.report_model,
+                    args.response_model,
+                    args.max_retries,
+                ): idxs
+                for idxs in batches
+            }
 
-            for fut in as_completed(futures):
-                idxs = futures[fut]
+            for future in as_completed(futures):
+                idxs = futures[future]
                 try:
-                    translated = fut.result()
+                    translated = future.result()
                     rows = []
-                    for item in translated:
-                        i = item["index"]
-                        record = finalize(item)
-                        completed[i] = record
-                        rows.append({"index": i, "record": record})
+                    for i in idxs:
+                        completed[i] = translated[i]
+                        rows.append({"index": i, "record": translated[i]})
                     append_jsonl(checkpoint, rows)
                     bar.update(len(idxs))
                 except Exception as exc:
                     failed.append(idxs)
-                    append_jsonl(errors, [{"indices": idxs, "error": str(exc)}])
+                    append_jsonl(
+                        errors,
+                        [{
+                            "indices": idxs,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }],
+                    )
                     print(f"\nFailed batch {idxs}: {exc}", file=sys.stderr)
 
     if failed:
-        print("Some records failed. Rerun the same command to retry unfinished records.", file=sys.stderr)
+        print(
+            "Some records failed. Rerun the same command to retry unfinished records.",
+            file=sys.stderr,
+        )
         return 1
 
     missing = [i for i in selected if i not in completed]
     if missing:
         raise RuntimeError(f"Missing records: {missing[:10]}")
 
-    tmp = args.output.with_name(args.output.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump([completed[i] for i in selected], f, ensure_ascii=False, indent=2)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = args.output.with_name(args.output.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as f:
+        json.dump(
+            [completed[i] for i in selected],
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
         f.write("\n")
-    tmp.replace(args.output)
+    temporary.replace(args.output)
+
     print(f"Completed: {args.output}")
     return 0
 
